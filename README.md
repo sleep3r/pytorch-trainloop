@@ -6,7 +6,7 @@
 
 **Some PyTorch Trainloop Example**
   
-*My vision of training loop in PyTorch. With DDP, configs, handsome logging and more*
+*My vision of training loop in pure PyTorch. With DDP, configs, handsome logging and more*
 
 [![CodeFactor](https://www.codefactor.io/repository/github/sleep3r/pytorch-trainloop/badge)](https://www.codefactor.io/repository/github/sleep3r/pytorch-trainloop)
 [![python](https://img.shields.io/badge/python_3.8-passing-success)](https://github.com/sleep3r/garrus/badge.svg?branch=main&event=push)
