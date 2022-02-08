@@ -1,6 +1,8 @@
 <div align="center">
 
 **Some PyTorch Trainloop Example**
+  
+*My vision of training loop in PyTorch. With DDP, configs, handsome logging and more*
 
 </div>
 
