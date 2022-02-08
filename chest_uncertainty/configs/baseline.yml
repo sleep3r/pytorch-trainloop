@@ -1,0 +1,118 @@
+training:
+    exp_name: 'baseline'
+    work_dir: '/home/sleep3r/sber/runs/chest_uncertainty'
+    log_level: INFO
+    watch_model:
+        log: "all"
+        log_freq: 1
+
+    seed: 228
+    precision: 10
+    deterministic: false
+
+    dist_params:
+        backend: nccl
+        init_method: env://
+    reduce_bn: true
+
+    load_from:
+
+    cudnn_benchmark: false # auto false if deterministic is true
+    channels_last: false
+    find_unused_parameters: false
+
+    clip_grad:
+    clip_mode:
+
+
+image_params: &image_params
+    height: 512
+    width: 512
+
+    img_norm_cfg:
+        mean: [ 0.485, 0.456, 0.406 ]
+        std: [ 0.229, 0.224, 0.225 ]
+
+
+loss:
+    type: segmentation_models_pytorch.utils.losses.DiceLoss
+
+
+model:
+    type: segmentation_models_pytorch.FPN
+    params:
+        encoder_name: se_resnext50_32x4d
+        encoder_weights: imagenet
+        classes: 1
+        activation: sigmoid
+
+    use_preprocessing: true
+
+
+evaluation:
+    metrics: [ "iou" ]
+    best_metric: "iou"
+
+
+stages:
+    stage_1:
+        total_epochs: 100
+
+        loader:
+            batch_size: &batch_size 10
+            pin_memory: true
+            num_workers: 0 # often is better to set 0 while distributed training
+            drop_last: true
+            shuffle: false
+
+            collate_fn:
+                type: dataset.Collect
+                params:
+                    meta_keys: [ ]
+
+        train_dataset:
+            kind: "train"
+            batch_size: *batch_size
+            steps_per_epoch: 20
+
+            image_params: *image_params
+
+            images_path: "/home/sleep3r/sber/dataset/images"
+            masks_path: "/home/sleep3r/sber/dataset/masks"
+            classes: &classes [ "pneumonia" ]
+
+            aggregate_masks: false
+            read_norma: true
+
+            transform:
+                type: transform.ChestTransform
+                params:
+                    kind: "train"
+                    image_params: *image_params
+                    augs_lvl: "hard"
+
+        val_dataset:
+            kind: "val"
+
+            image_params: *image_params
+
+            images_path: "/home/sleep3r/sber/dataset/images_val"
+            masks_path: "/home/sleep3r/sber/dataset/masks_val"
+            classes: *classes
+
+            aggregate_masks: true
+            read_norma: false
+            per_folder_ratio: 0.05
+
+            transform:
+                type: transform.ChestTransform
+                params:
+                    kind: "val"
+                    image_params: *image_params
+
+        optimizer:
+            type: torch.optim.Adam
+            params:
+                lr: 0.0003
+
+        lr_scheduler:
