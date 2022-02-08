@@ -1,7 +1,7 @@
 <div align="center">
 
 <a href="">
-  <img src="https://i.ibb.co/bW3My3c/2022-02-09-02-21-08.png" style="width: 70%; height: auto;">
+  <img src="https://i.ibb.co/bW3My3c/2022-02-09-02-21-08.png" style="width: 75%; height: auto;">
 </a>  
 
 **Some PyTorch Trainloop Example**
