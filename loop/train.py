@@ -30,7 +30,7 @@ from utils.metrics import calc_metrics, AverageMeter
 from utils.path import mkdir_or_exist
 from utils.cuda import NativeScaler
 from utils.progress import progress, task, refresh_task, update_task, remove_task
-from utils.tracking import log_artifact
+from utils.tracking import log_artifact, save_splits
 from utils.training import set_random_seed
 
 
@@ -576,6 +576,10 @@ def main(cfg: DLConfig):
             val_dataset = ChestDataset(**cfg.val_dataset, subsamples=val_subsamples)
             val_loader_cfg = get_loader_config(cfg, val_dataset, kind="val", distributed=distributed)
             val_dataloader = DataLoader(val_dataset, **val_loader_cfg)
+            
+            if cfg.local_rank == 0:
+                # saving data splits for further use in testing
+                save_splits(train_subsamples, val_subsamples, cv_step, exp_dir=meta["exp_dir"])
 
             meta = run_cv_step(
                 cv_step=cv_step + 1,
