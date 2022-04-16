@@ -1,4 +1,3 @@
-import io
 import re
 import logging
 from typing import Union, Optional, Dict, Any
@@ -6,7 +5,6 @@ from collections import OrderedDict
 
 import torch
 import ruamel.yaml
-from mmcv import FileClient
 from pathlib import Path
 from torch.optim import Optimizer
 
@@ -241,7 +239,8 @@ def save_checkpoint(
             FileClient. See :class:`mmcv.fileio.FileClient` for details.
             Default: None.
     """
-    model = model.module
+    if hasattr(model, "module"):
+        model = model.module
 
     checkpoint = {
         "meta": meta,
@@ -255,10 +254,7 @@ def save_checkpoint(
         for name, optim in optimizer.items():
             checkpoint['optimizer'][name] = optim.state_dict()
 
-    file_client = FileClient.infer_client(file_client_args, filename)
-    with io.BytesIO() as f:
-        torch.save(checkpoint, f)
-        file_client.put(f.getvalue(), filename)
+    torch.save(checkpoint, filename)
 
 
 def load_model(

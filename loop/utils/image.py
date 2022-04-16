@@ -7,21 +7,21 @@ import numpy as np
 from cv2 import IMREAD_COLOR, IMREAD_GRAYSCALE, IMREAD_UNCHANGED
 
 imread_flags = {
-    'color': IMREAD_COLOR,
-    'grayscale': IMREAD_GRAYSCALE,
-    'unchanged': IMREAD_UNCHANGED
+    "color": IMREAD_COLOR,
+    "grayscale": IMREAD_GRAYSCALE,
+    "unchanged": IMREAD_UNCHANGED,
 }
 
 cv2_interp_codes = {
-    'nearest': cv2.INTER_NEAREST,
-    'bilinear': cv2.INTER_LINEAR,
-    'bicubic': cv2.INTER_CUBIC,
-    'area': cv2.INTER_AREA,
-    'lanczos': cv2.INTER_LANCZOS4
+    "nearest": cv2.INTER_NEAREST,
+    "bilinear": cv2.INTER_LINEAR,
+    "bicubic": cv2.INTER_CUBIC,
+    "area": cv2.INTER_AREA,
+    "lanczos": cv2.INTER_LANCZOS4,
 }
 
 
-def imread(img_or_path, flag='color', channel_order='bgr'):
+def imread(img_or_path, flag="color", channel_order="bgr"):
     """
     Reads an image.
 
@@ -44,24 +44,18 @@ def imread(img_or_path, flag='color', channel_order='bgr'):
         return img_or_path
     elif isinstance(img_or_path, str):
         if not os.path.isfile(img_or_path):
-            raise FileNotFoundError(f'img file does not exist: {img_or_path}')
+            raise FileNotFoundError(f"img file does not exist: {img_or_path}")
 
         flag = imread_flags[flag] if isinstance(flag, str) else flag
         img = cv2.imread(img_or_path, flag)
-        if flag == IMREAD_COLOR and channel_order == 'rgb':
+        if flag == IMREAD_COLOR and channel_order == "rgb":
             cv2.cvtColor(img, cv2.COLOR_BGR2RGB, img)
         return img
     else:
         raise TypeError('"img" must be a numpy array or a str or a pathlib.Path object')
 
 
-def imresize(
-        img,
-        size,
-        return_scale=False,
-        interpolation='bilinear',
-        out=None
-):
+def imresize(img, size, return_scale=False, interpolation="bilinear", out=None):
     """
     Resizes image to a given size.
 
@@ -88,14 +82,7 @@ def imresize(
         return resized_img, w_scale, h_scale
 
 
-def impad(
-        img,
-        *,
-        shape=None,
-        padding=None,
-        pad_val=0,
-        padding_mode='constant'
-):
+def impad(img, *, shape=None, padding=None, pad_val=0, padding_mode="constant"):
     """
     Pads the given image to a certain shape or pad on all sides with
     specified padding mode and padding value.
@@ -137,7 +124,7 @@ def impad(
     if isinstance(pad_val, tuple):
         assert len(pad_val) == img.shape[-1]
     elif not isinstance(pad_val, numbers.Number):
-        raise TypeError(f'pad_val must be a int or a tuple. But received {type(pad_val)}')
+        raise TypeError(f"pad_val must be a int or a tuple. But received {type(pad_val)}")
 
     # check padding
     if isinstance(padding, tuple) and len(padding) in [2, 4]:
@@ -146,16 +133,16 @@ def impad(
     elif isinstance(padding, numbers.Number):
         padding = (padding, padding, padding, padding)
     else:
-        raise ValueError(f'Padding must be a int or a 2, or 4 element tuple. But received {padding}')
+        raise ValueError(f"Padding must be a int or a 2, or 4 element tuple. But received {padding}")
 
     # check padding mode
-    assert padding_mode in ['constant', 'edge', 'reflect', 'symmetric']
+    assert padding_mode in ["constant", "edge", "reflect", "symmetric"]
 
     border_type = {
-        'constant': cv2.BORDER_CONSTANT,
-        'edge': cv2.BORDER_REPLICATE,
-        'reflect': cv2.BORDER_REFLECT_101,
-        'symmetric': cv2.BORDER_REFLECT
+        "constant": cv2.BORDER_CONSTANT,
+        "edge": cv2.BORDER_REPLICATE,
+        "reflect": cv2.BORDER_REFLECT_101,
+        "symmetric": cv2.BORDER_REFLECT,
     }
     img = cv2.copyMakeBorder(
         img,
@@ -164,6 +151,6 @@ def impad(
         padding[0],
         padding[2],
         border_type[padding_mode],
-        value=pad_val
+        value=pad_val,
     )
     return img

@@ -1,17 +1,3 @@
-"""
-Adaptive Gradient Clipping
-An impl of AGC, as per (https://arxiv.org/abs/2102.06171):
-@article{brock2021high,
-  author={Andrew Brock and Soham De and Samuel L. Smith and Karen Simonyan},
-  title={High-Performance Large-Scale Image Recognition Without Normalization},
-  journal={arXiv preprint arXiv:},
-  year={2021}
-}
-Code references:
-  * Official JAX impl (paper authors): https://github.com/deepmind/deepmind-research/tree/master/nfnets
-  * Phil Wang's PyTorch gist: https://gist.github.com/lucidrains/0d6560077edac419ab5d3aa29e674d5c
-Hacked together by / Copyright 2021 Ross Wightman
-"""
 import torch
 
 
@@ -40,7 +26,9 @@ def adaptive_clip_grad(parameters, clip_factor=0.01, eps=1e-3, norm_type=2.0):
 
 
 def dispatch_clip_grad(parameters, value: float, mode: str = 'norm', norm_type: float = 2.0):
-    """ Dispatch to gradient clipping method
+    """
+    Dispatch to gradient clipping method
+
     Args:
         parameters (Iterable): model parameters to clip
         value (float): clipping value/factor/norm, mode dependant

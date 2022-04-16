@@ -1,14 +1,21 @@
 training:
-    exp_name: 'chest_uncertainty_base'
-    work_dir: ''
+    exp_name: 'baseline'
     log_level: INFO
-    watch_model:
-        log: "all"
-        log_freq: 1
+
+    total_epochs: 20
+
+    work_dir: '/data/sleep3r/runs'
+    images_path: &images_path "/data/sleep3r/chest_dataset/images"
+    masks_path: &masks_path "/data/sleep3r/chest_dataset/masks"
+    duplicates_path: &duplicates_path "/data/sleep3r/chest_dataset/groups.json"
+
+    classes: &classes [ "pneumonia" ]
+    projections: &projections [ "pa" ]
 
     seed: 228
     precision: 10
     deterministic: false
+    fold_seed_step: 5
 
     dist_params:
         backend: nccl
@@ -35,11 +42,11 @@ image_params: &image_params
 
 
 loss:
-    type: smp.utils.losses.DiceLoss
+    type: segmentation_models_pytorch.utils.losses.DiceLoss
 
 
 model:
-    type: segmentation_models.FPN
+    type: segmentation_models_pytorch.FPN
     params:
         encoder_name: se_resnext50_32x4d
         encoder_weights: imagenet
@@ -51,56 +58,75 @@ evaluation:
     metrics: [ "iou" ]
     best_metric: "iou"
 
-stages:
-    stage_1:
-        total_epochs: 100
 
-        loader:
-            batch_size: &batch_size 8
-            pin_memory: true
-            num_workers: 0 # better to set 0 when distributed training
-            drop_last: true
-            shuffle: false
+cross_validation:
+    n_splits: 5
 
-            collate_fn:
-                type: dataset.Collect
-                params:
-                    meta_keys: [ ]
+    duplicates_path: *duplicates_path
 
-        train_dataset:
+
+loader:
+    batch_size: &batch_size 15
+    pin_memory: true
+    num_workers: 0 # often is better to set 0 while distributed training
+    drop_last: true
+    shuffle: false
+
+    collate_fn:
+        type: dataset.Collect
+        params:
+            meta_keys: [ ]
+
+
+train_dataset:
+    kind: "train"
+    batch_size: *batch_size
+    steps_per_epoch: 20
+
+    images_path: *images_path
+    masks_path: *masks_path
+
+    classes: *classes
+    projections: *projections
+
+    image_params: *image_params
+
+    aggregate_masks: true
+    read_norma: true
+
+    transform:
+        type: transform.ChestTransform
+        params:
             kind: "train"
-            batch_size: *batch_size
-            steps_per_epoch: 50
-
             image_params: *image_params
+            augs_lvl: "hard"
 
-            images_path: ""
-            masks_path: ""
-            classes: &classes [ "pneumonia" ]
 
-            transform:
-                type: transform.ChestTransform
-                params:
-                    image_params: *image_params
-                    augs_lvl: "hard"
+val_dataset:
+    kind: "val"
 
-        val_dataset:
+    image_params: *image_params
+
+    images_path: *images_path
+    masks_path: *masks_path
+
+    classes: *classes
+    projections: *projections
+
+    aggregate_masks: true
+    read_norma: true
+
+    transform:
+        type: transform.ChestTransform
+        params:
             kind: "val"
-
             image_params: *image_params
 
-            images_path: ""
-            masks_path: ""
-            classes: *classes
 
-            transform:
-                type: transform.ChestTransform
-                params:
-                    image_params: *image_params
+optimizer:
+    type: torch.optim.Adam
+    params:
+        lr: 0.0003
 
-        optimizer:
-            type: torch.optim.Adam
-            params:
-                lr: 0.001
 
-        lr_scheduler:
+lr_scheduler:

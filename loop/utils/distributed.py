@@ -11,6 +11,7 @@ def init_distributed(cfg: DLConfig) -> bool:
     """Initializes distributed training if cfg.training.distributed == true."""
     if not cfg.training.distributed:
         distributed = False
+        cfg.local_rank, cfg.world_size = get_dist_info()
     else:
         distributed = True
 

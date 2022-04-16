@@ -3,7 +3,6 @@ ruamel.yaml==0.17.17
 addict==2.3.0
 torch==1.10.1
 torchvision==0.11.2
-mmcv==1.4.3
 opencv-python==4.5.5.62
 opencv-python-headless==4.5.5.62
 scikit-learn==1.0.2
@@ -12,3 +11,4 @@ imgaug==0.4.0
 gitpython==3.1.26
 wandb==0.12.10
 rich==11.0.0
+segmentation-models-pytorch==0.2.1

@@ -1,7 +1,5 @@
-import os
 import git
 import json
-import random
 import logging
 from pathlib import Path
 from datetime import datetime
@@ -11,13 +9,13 @@ from contextlib import nullcontext
 from typing import Optional, Union, Callable
 from collections import defaultdict
 
-import wandb
 import numpy as np
+import wandb
 import torch
 import torch.distributed as dist
+from sklearn.model_selection import GroupKFold, KFold
 from torch.utils.data import DataLoader
 from torch.nn.parallel import DataParallel as DP, DistributedDataParallel as DDP
-import segmentation_models_pytorch as smp
 from rich.progress import TaskID
 
 from config import load_config, DLConfig, object_from_dict
@@ -26,12 +24,14 @@ from checkpoint import load_checkpoint, save_checkpoint
 from utils.clip_grad import dispatch_clip_grad
 from utils.distributed import init_distributed, distribute_bn, reduce_tensor
 from utils.env import collect_env
+from utils.io import read_duplicates, read_norma_ids
 from utils.logging import get_logger, status
 from utils.metrics import calc_metrics, AverageMeter
 from utils.path import mkdir_or_exist
 from utils.cuda import NativeScaler
-from utils.progress import progress, task, refresh_task, update_task
+from utils.progress import progress, task, refresh_task, update_task, remove_task
 from utils.tracking import log_artifact
+from utils.training import set_random_seed
 
 
 def prepare_exp(cfg: DLConfig) -> (dict, logging.Logger):
@@ -52,11 +52,11 @@ def prepare_exp(cfg: DLConfig) -> (dict, logging.Logger):
     # set random seeds
     meta = determine_exp(cfg, meta, logger=logger)
 
-    # setup eval metrics tracking
-    meta = setup_metrics(cfg, meta, logger=logger)
-
     # setup w&b tracking
-    setup_tracking(cfg, meta)
+    meta = setup_tracking(cfg, meta)
+
+    # setup eval metrics tracking
+    meta = define_metrics(cfg, meta, logger=logger)
     return meta, logger
 
 
@@ -77,36 +77,13 @@ def create_workdir(cfg: DLConfig, meta: dict) -> dict:
     return meta
 
 
-def set_random_seed(seed: int = 228, precision: int = 10, deterministic: bool = False) -> None:
-    """
-    Sets random seed.
-
-    Args:
-        seed (int): Seed to be used.
-        deterministic (bool): Whether to set the deterministic option for CUDNN backend,
-                              i.e., set `torch.backends.cudnn.deterministic` to True and
-                              `torch.backends.cudnn.benchmark` to False. Default: False.
-    """
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-    torch.set_printoptions(precision=precision)
-    os.environ['PYTHONHASHSEED'] = str(seed)
-
-    if deterministic:
-        torch.backends.cudnn.deterministic = True  # noqa
-        torch.backends.cudnn.benchmark = False  # noqa
-
-
 def env_collect(cfg: DLConfig, meta: dict, logger: logging.Logger) -> dict:
     """Collects environment information."""
     env_info_dict = collect_env()
-    env_info = '\n'.join([f'{k}: {v}' for k, v in env_info_dict.items()])
-    dash_line = '-' * 60 + '\n'
+    env_info = "\n".join([f"{k}: {v}" for k, v in env_info_dict.items()])
+    dash_line = "-" * 60 + "\n"
 
-    logger.info('Environment info:\n' + dash_line + env_info + '\n' + dash_line)
+    logger.info("Environment info:\n" + dash_line + env_info + "\n" + dash_line)
 
     repo = git.Repo(search_parent_directories=True)
     meta["sha"] = repo.head.object.hexsha
@@ -117,71 +94,76 @@ def env_collect(cfg: DLConfig, meta: dict, logger: logging.Logger) -> dict:
 def determine_exp(cfg: DLConfig, meta: dict, logger: logging.Logger) -> dict:
     """Sets seed and experiment name."""
     if cfg.training.seed is not None:
-        logger.info(f'Set random seed to {cfg.training.seed}, deterministic: {cfg.training.deterministic}\n')
+        logger.info(f"Set random seed to {cfg.training.seed}, deterministic: {cfg.training.deterministic}\n")
         set_random_seed(
             cfg.training.seed,
             precision=cfg.training.precision,
-            deterministic=cfg.training.deterministic
+            deterministic=cfg.training.deterministic,
         )
 
-    meta['seed'] = cfg.training.seed
-    meta['exp_name'] = cfg.training.exp_name
+    meta["seed"] = cfg.training.seed
+    meta["exp_name"] = cfg.training.exp_name
     return meta
 
 
-def setup_metrics(cfg: DLConfig, meta: dict, logger: logging.Logger) -> dict:
-    meta["stages"] = defaultdict(dict)
+def define_metrics(cfg: DLConfig, meta: dict, logger: logging.Logger) -> dict:
+    meta["crossval"] = defaultdict(dict)
 
-    for stage in cfg.stages:
-        meta["stages"][stage]["train_loss"] = []
-        meta["stages"][stage]["val_loss"] = []
+    for cv_step in range(1, cfg.cross_validation.n_splits + 1):
+        meta["crossval"][cv_step]["train_loss"] = []
+        meta["crossval"][cv_step]["val_loss"] = []
 
-        meta["stages"][stage]["lr"] = []
+        meta["crossval"][cv_step]["lr"] = []
 
-        meta["stages"][stage]["best_metric"] = 0
-        meta["stages"][stage]["best_epoch"] = 0
+        meta["crossval"][cv_step]["best_metric"] = 0
+        meta["crossval"][cv_step]["best_epoch"] = 0
+
+        if cfg.local_rank == 0:
+            wandb.define_metric(f"CV {cv_step}/*", step_metric=f"CV {cv_step}/step")
     return meta
 
 
-def setup_tracking(cfg: DLConfig, meta: dict) -> None:
+def setup_tracking(cfg: DLConfig, meta: dict) -> dict:
     """Sets up mlflow tracking."""
     if cfg.local_rank == 0:
-        wandb.init(
+        run = wandb.init(
             project="chest_uncertainty",
-            name=cfg.training.exp_name,
-            config=cfg.to_dict()
+            name=meta["run_name"],
+            config=cfg.to_dict(),
         )
+        meta["exp_url"] = run.get_url()
+    return meta
 
 
 def track_metrics(
         cfg: DLConfig,
-        stage: str,
+        cv_step: int,
         epoch: int,
         train_metrics: dict,
         eval_metrics: dict,
         meta: dict,
-        logger: logging.Logger
+        logger: logging.Logger,
 ) -> None:
     if cfg.local_rank == 0:
-        dash_line = '-' * 60 + '\n'
+        dash_line = "-" * 60 + "\n"
 
-        meta["stages"][stage]["train_loss"].append(train_metrics["loss"])
-        meta["stages"][stage]["val_loss"].append(eval_metrics["loss"])
+        meta["crossval"][cv_step]["train_loss"].append(train_metrics["loss"])
+        meta["crossval"][cv_step]["val_loss"].append(eval_metrics["loss"])
 
         # loss
         loss_info = f'[Epoch]: {epoch}\nTrain loss: {train_metrics["loss"]}\nVal loss: {eval_metrics["loss"]}\n'
-        wandb.log({f"{stage}_train_loss": train_metrics["loss"]}, step=epoch)
-        wandb.log({f"{stage}_val_loss": eval_metrics["loss"]}, step=epoch)
+        wandb.log({f"CV {cv_step}/train_loss": train_metrics["loss"], f"CV {cv_step}/step": epoch})
+        wandb.log({f"CV {cv_step}/val_loss": eval_metrics["loss"], f"CV {cv_step}/step": epoch})
 
         # metrics
-        metrics_info = '\n'.join([f'{k}: {v}' for k, v in eval_metrics.items() if k != "loss"])
+        metrics_info = "\n".join([f"{k}: {v}" for k, v in eval_metrics.items() if k != "loss"])
         for metric in cfg.evaluation.metrics:
-            wandb.log({f"{stage}_{metric}": eval_metrics[metric]}, step=epoch)
+            wandb.log({f"CV {cv_step}/{metric}": eval_metrics[metric], f"CV {cv_step}/step": epoch})
 
         # lr
-        wandb.log({f"{stage}_lr": train_metrics["lr"]}, step=epoch)
+        wandb.log({f"CV {cv_step}/lr": train_metrics["lr"], f"CV {cv_step}/step": epoch})
 
-        logger.info(dash_line + loss_info + '\n' + metrics_info + '\n' + dash_line)
+        logger.info(dash_line + loss_info + "\n" + metrics_info + "\n" + dash_line)
 
 
 def log_artifacts(cfg: DLConfig, meta: dict) -> None:
@@ -204,33 +186,34 @@ def log_artifacts(cfg: DLConfig, meta: dict) -> None:
 
 def get_loader_config(
         cfg: DLConfig,
-        stage: str,
         dataset: ChestDataset,
         distributed: bool,
-        kind: str = "train"
+        kind: str = "train",
 ) -> dict:
     """Builds loader config."""
-    stage_cfg = cfg.stages[stage]
-    collate_fn = object_from_dict(stage_cfg.loader.get("collate_fn", {}))
+    collate_fn = object_from_dict(cfg.loader.get("collate_fn", {}))
 
     loader_cfg = {
-        **stage_cfg.loader,
-        **dict(
-            collate_fn=collate_fn
-        ),
+        **cfg.loader,
+        **dict(collate_fn=collate_fn),
     }
     # TRAIN
     if kind == "train":
         if distributed:
             loader_cfg["sampler"] = torch.utils.data.distributed.DistributedSampler(
-                dataset, shuffle=True, num_replicas=cfg.world_size, rank=cfg.local_rank  # noqa
+                dataset,
+                shuffle=True,
+                num_replicas=cfg.world_size,
+                rank=cfg.local_rank,  # noqa
             )
 
     # VAL
     elif kind == "val":
         if distributed:
             loader_cfg["sampler"] = OrderedDistributedSampler(
-                dataset, num_replicas=cfg.world_size, rank=cfg.local_rank
+                dataset,
+                num_replicas=cfg.world_size,
+                rank=cfg.local_rank
             )
         loader_cfg["drop_last"] = False
     else:
@@ -268,13 +251,23 @@ def val_epoch(
         for batch_idx, data_batch in enumerate(loader):
             data_batch["image"] = data_batch["image"].cuda()
             data_batch["mask"] = data_batch["mask"].cuda()
+            data_batch["label"] = data_batch["label"].cuda()
 
             if cfg.training.channels_last:
                 data_batch["image"] = data_batch["image"].contiguous(memory_format=torch.channels_last)  # noqa
 
             with amp_autocast():
                 outputs = model(data_batch["image"])
-                loss = loss_fn(outputs, data_batch["mask"])
+
+                if cfg.model.params.aux_params is not None:
+                    # with clf head
+                    seg_loss = loss_fn(outputs[0], data_batch["mask"].float())
+                    clf_loss = torch.nn.BCELoss()(outputs[1][:, 1], data_batch["label"])
+                    loss = seg_loss + clf_loss
+                    outputs = outputs[0]
+                else:
+                    loss = loss_fn(outputs, data_batch["mask"].float())
+
                 num_samples = data_batch["image"].size(0)
                 batch_metrics = {}
 
@@ -314,12 +307,12 @@ def train_one_epoch(
         progress_task: Optional[TaskID],
         amp_autocast=nullcontext,
         gradient_scaler: NativeScaler = None,
-        logger: logging.Logger = None
+        logger: logging.Logger = None,
 ):
     metrics = {}
     losses_m = AverageMeter()
 
-    second_order = hasattr(optimizer, 'is_second_order') and optimizer.is_second_order
+    second_order = hasattr(optimizer, "is_second_order") and optimizer.is_second_order
 
     model.train()
 
@@ -330,13 +323,22 @@ def train_one_epoch(
 
         data_batch["image"] = data_batch["image"].cuda()
         data_batch["mask"] = data_batch["mask"].cuda()
+        data_batch["label"] = data_batch["label"].cuda()
 
         if cfg.training.channels_last:
             data_batch["image"] = data_batch["image"].contiguous(memory_format=torch.channels_last)  # noqa
 
         with amp_autocast():
             outputs = model(data_batch["image"])
-            loss = loss_fn(outputs, data_batch["mask"])
+
+            if cfg.model.params.aux_params is not None:
+                # with clf head
+                seg_loss = loss_fn(outputs[0], data_batch["mask"].float())
+                clf_loss = torch.nn.BCELoss()(outputs[1][:, 1], data_batch["label"])
+                loss = seg_loss + clf_loss
+            else:
+                loss = loss_fn(outputs, data_batch["mask"].float())
+
             num_samples = data_batch["image"].size(0)
 
         if not distributed:
@@ -345,11 +347,12 @@ def train_one_epoch(
         optimizer.zero_grad()
         if gradient_scaler is not None:
             gradient_scaler(
-                loss, optimizer,
+                loss,
+                optimizer,
                 clip_grad=cfg.training.clip_grad,
                 clip_mode=cfg.training.clip_mode,
                 parameters=model.parameters(),
-                create_graph=second_order
+                create_graph=second_order,
             )
         else:
             loss.backward(create_graph=second_order)
@@ -358,7 +361,7 @@ def train_one_epoch(
                 dispatch_clip_grad(
                     model.parameters(),
                     value=cfg.training.clip_grad,
-                    mode=cfg.training.clip_mode
+                    mode=cfg.training.clip_mode,
                 )
 
             optimizer.step()
@@ -372,17 +375,17 @@ def train_one_epoch(
         update_task(progress_task, advance=cfg.world_size)
         # end for
 
-    if hasattr(optimizer, 'sync_lookahead'):
+    if hasattr(optimizer, "sync_lookahead"):
         optimizer.sync_lookahead()  # noqa
 
-    lrl = [param_group['lr'] for param_group in optimizer.param_groups]
+    lrl = [param_group["lr"] for param_group in optimizer.param_groups]
     metrics["loss"] = losses_m.avg
     metrics["lr"] = sum(lrl) / len(lrl)
     return metrics
 
 
-def run_stage(
-        stage: str,
+def run_cv_step(
+        cv_step: int,
         model: Union[DP, DDP],
         loss_fn: Callable,
         cfg: DLConfig,
@@ -396,54 +399,82 @@ def run_stage(
         distributed: bool,
         logger: logging.Logger,
 ) -> dict:
-    logger.info(f"Training {stage}\n")
-    try:
-        with progress:
-            epochs_num = cfg.stages[stage].total_epochs
+    """
+    Runs training and validation for one crossval step.
 
-            epoch_progress = task(f"[white]{stage}\n", total=epochs_num)
-            train_progress = task(f"[blue]Train", total=len(train_dataloader) * cfg.world_size, start=False)
-            val_progress = task(f"[red]Validation\n", total=len(val_dataloader) * cfg.world_size, start=False)
+    Args:
+        cv_step: crossval step number;
+        model: model to train;
+        loss_fn: loss function;
+        cfg: config;
+        train_dataloader: training dataloader;
+        val_dataloader: validation dataloader;
+        optimizer: optimizer;
+        lr_scheduler: learning rate scheduler;
+        gradient_scaler: gradient scaler;
+        amp_autocast: mixed precision function;
+        meta: meta data;
+        distributed: whether to use distributed training;
+        logger: logger.
+    Returns:
+        dict: updated meta training dictionary.
+    """
+    with progress:
+        epochs_num = cfg.training.total_epochs
 
-            for epoch in range(1, epochs_num + 1):
-                if distributed and hasattr(train_dataloader.sampler, 'set_epoch'):  # noqa
-                    train_dataloader.sampler.set_epoch(epoch - 1)  # noqa
+        epoch_progress = task(f"[white]CV {cv_step}\n", total=epochs_num)
+        train_progress = task(f"[blue]Train", total=len(train_dataloader) * cfg.world_size, start=False)
+        val_progress = task(f"[red]Validation\n", total=len(val_dataloader) * cfg.world_size, start=False)
 
-                train_metrics = train_one_epoch(model, loss_fn, train_dataloader, optimizer, cfg,
-                                                distributed=distributed,
-                                                amp_autocast=amp_autocast,
-                                                gradient_scaler=gradient_scaler,
-                                                progress_task=train_progress,
-                                                logger=logger)
+        for epoch in range(1, epochs_num + 1):
+            if distributed and hasattr(train_dataloader.sampler, "set_epoch"):  # noqa
+                train_dataloader.sampler.set_epoch(epoch - 1)  # noqa
 
-                if distributed:
-                    distribute_bn(model, cfg.world_size, cfg.training.reduce_bn)
+            train_metrics = train_one_epoch(
+                model,
+                loss_fn,
+                train_dataloader,
+                optimizer,
+                cfg,
+                distributed=distributed,
+                amp_autocast=amp_autocast,
+                gradient_scaler=gradient_scaler,
+                progress_task=train_progress,
+                logger=logger,
+            )
 
-                eval_metrics = val_epoch(model, loss_fn, val_dataloader, cfg,
-                                         distributed=distributed,
-                                         amp_autocast=amp_autocast,
-                                         progress_task=val_progress)
+            if distributed:
+                distribute_bn(model, cfg.world_size, cfg.training.reduce_bn)
 
-                update_task(epoch_progress)
+            eval_metrics = val_epoch(
+                model,
+                loss_fn,
+                val_dataloader,
+                cfg,
+                distributed=distributed,
+                amp_autocast=amp_autocast,
+                progress_task=val_progress,
+            )
 
-                if lr_scheduler is not None:
-                    lr_scheduler.step()
+            update_task(epoch_progress)
 
-                track_metrics(cfg, stage, epoch, train_metrics, eval_metrics, meta, logger)
+            if lr_scheduler is not None:
+                lr_scheduler.step()
 
-                if eval_metrics[cfg.evaluation.best_metric] > meta["stages"][stage]["best_metric"]:
-                    meta["stages"][stage]["best_metric"] = eval_metrics[cfg.evaluation.best_metric]
-                    meta["stages"][stage]["best_epoch"] = epoch
+            track_metrics(cfg, cv_step, epoch, train_metrics, eval_metrics, meta, logger)
 
-                    if cfg.local_rank == 0:
-                        logger.info(f"Saving checkpoint for {stage}, epoch {epoch}\n")
-                        save_checkpoint(model, meta["exp_dir"] / f"{stage}_best.pth")
-                # end for
-            # end with
-    except KeyboardInterrupt:
-        if cfg.local_rank == 0:
-            logger.info("Training was interrupted. Saving last checkpoint\n")
-            save_checkpoint(model, meta["exp_dir"] / f"{stage}_last.pth")
+            if eval_metrics[cfg.evaluation.best_metric] > meta["crossval"][cv_step]["best_metric"]:
+                meta["crossval"][cv_step]["best_metric"] = eval_metrics[cfg.evaluation.best_metric]
+                meta["crossval"][cv_step]["best_epoch"] = epoch
+
+                if cfg.local_rank == 0:
+                    logger.info(f"Saving checkpoint for crossval step {cv_step}, epoch {epoch}\n")
+                    save_checkpoint(model, meta["exp_dir"] / f"CV{cv_step}_best.pth")
+            # end for
+        remove_task(epoch_progress)
+        remove_task(train_progress)
+        remove_task(val_progress)
+        # end with
     return meta
 
 
@@ -455,87 +486,118 @@ def main(cfg: DLConfig):
     meta, logger = prepare_exp(cfg)
 
     # set cudnn_benchmark
-    torch.backends.cudnn.benchmark = cfg.training.get('cudnn_benchmark', False)  # noqa
+    torch.backends.cudnn.benchmark = cfg.training.get("cudnn_benchmark", False)  # noqa
 
     # log some basic info
-    logger.info(f'Distributed training: {distributed}\n')
-    logger.info(f'Config:\n{cfg.pretty_text}\n')
+    logger.info(f"Distributed training: {distributed}\n")
+    logger.info(f"Config:\n{cfg.pretty_text}\n")
 
     # init model
     model = object_from_dict(cfg.model)
-    if cfg.model.use_preprocessing:
-        preprocessing_fn = smp.encoders.get_preprocessing_fn(
-            cfg.model.params.encoder_name,
-            cfg.model.params.encoder_weights
-        )
-    else:
-        preprocessing_fn = None
+
     loss_fn = object_from_dict(cfg.loss)
 
     # put model on gpus, enable channels last layout if set
-    model.cuda()
+    model.cuda()  # noqa
     if cfg.training.channels_last:
         model = model.to(memory_format=torch.channels_last)  # noqa
 
     # setup synchronized BatchNorm for distributed training
-    if distributed:
-        assert cfg.training.reduce_bn
-
+    if distributed and cfg.training.reduce_bn:
         model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
 
         if cfg.local_rank == 0:
-            logger.warning('Converted model to use Synchronized BatchNorm. WARNING: You may have issues if using '
-                           'zero initialized BN layers (enabled by default for ResNets) while sync-bn enabled.\n')
+            logger.warning(
+                "Converted model to use Synchronized BatchNorm. WARNING: You may have issues if using "
+                "zero initialized BN layers (enabled by default for ResNets) while sync-bn enabled.\n"
+            )
 
     if distributed:
         model = DDP(
             model,
             device_ids=[cfg.local_rank],
-            output_device=cfg.local_rank
+            output_device=cfg.local_rank,
+            find_unused_parameters=cfg.training.get("find_unused_parameters", False)  # noqa
         )
-        model.find_unused_parameters = cfg.training.get('find_unused_parameters', False)
+        cfg.training.get("find_unused_parameters", False)
     else:
         model = DP(model, device_ids=[0])
 
-    if cfg.training.load_from:
-        logger.info(f'Load checkpoint from {cfg.training.load_from}\n')
-        load_checkpoint(model, cfg.training.load_from, strict=False)
+    # saving base model weights for further reinitialization during CV
+    save_checkpoint(model, meta["exp_dir"] / "base_model.pth")
 
-    if cfg.training.watch_model and cfg.local_rank == 0:
-        wandb.watch(model, **cfg.training.watch_model)
+    # set optimizer and policy
+    optimizer = object_from_dict(cfg.optimizer, params=model.parameters())
+    amp_autocast = nullcontext  # torch.cuda.amp.autocast
+    lr_scheduler = object_from_dict(cfg.lr_scheduler, optimizer=optimizer)
+    gradient_scaler = None
 
-    for stage_name, stage_cfg in cfg.stages.items():
-        # set train datasets and loaders
-        train_dataset = ChestDataset(**stage_cfg.train_dataset, preprocessing=preprocessing_fn)
-        train_loader_cfg = get_loader_config(cfg, stage_name, train_dataset, distributed=distributed)
-        train_dataloader = DataLoader(train_dataset, **train_loader_cfg)
+    # here we will perform cross validation
+    # we will do groups split on the known data ids, using duplicates data
+    duplicates = read_duplicates(cfg.cross_validation.duplicates_path)
+    groups = [*duplicates.values()]
+    group_cv = GroupKFold(n_splits=cfg.cross_validation.n_splits)
+    pneumonia_ids = np.array([*duplicates.keys()], dtype=int)
+    pneumonia_split = group_cv.split(pneumonia_ids, None, groups)
 
-        # set val datasets and loaders
-        val_dataset = ChestDataset(**stage_cfg.val_dataset, preprocessing=preprocessing_fn)
-        val_loader_cfg = get_loader_config(cfg, stage_name, val_dataset, kind="val", distributed=distributed)
-        val_dataloader = DataLoader(val_dataset, **val_loader_cfg)
+    # no need for such grouping of norma images
+    norma_ids = np.array(read_norma_ids(cfg.training.images_path), dtype=int)
+    cv = KFold(n_splits=cfg.cross_validation.n_splits, shuffle=True)
+    norma_split = cv.split(norma_ids)
 
-        # set optimizer and policy
-        optimizer = object_from_dict(stage_cfg.optimizer, params=model.parameters())
-        amp_autocast = nullcontext  # torch.cuda.amp.autocast
-        lr_scheduler = object_from_dict(stage_cfg.lr_scheduler, optimizer=optimizer)
-        gradient_scaler = None
+    logger.info(f'Start running, host: {meta["host_name"]}, exp_dir: {meta["exp_dir"]}\n')
+    for cv_step in range(cfg.cross_validation.n_splits):
+        logger.info(f"Cross validation step: {cv_step + 1}\n")
+        try:
+            # reset seed for each cross validation step
+            cfg.training.seed += cfg.training.fold_seed_step
+            set_random_seed(cfg.training.seed)
 
-        logger.info(f'Start running, host: {meta["host_name"]}, exp_dir: {meta["exp_dir"]}\n')
-        meta = run_stage(stage=stage_name,
-                         model=model,
-                         loss_fn=loss_fn,
-                         cfg=cfg,
-                         train_dataloader=train_dataloader,
-                         val_dataloader=val_dataloader,
-                         optimizer=optimizer,
-                         amp_autocast=amp_autocast,
-                         lr_scheduler=lr_scheduler,
-                         gradient_scaler=gradient_scaler,
-                         meta=meta,
-                         distributed=distributed,
-                         logger=logger)
-        # end for
+            if cfg.training.load_from:
+                logger.info(f"Load checkpoint from {cfg.training.load_from}\n")
+                load_checkpoint(model, cfg.training.load_from, strict=False)
+            else:
+                logger.info(f"Model has been reinitialized\n")
+                load_checkpoint(model, meta["exp_dir"] / "base_model.pth")
+                model.module.initialize()
+
+            # reading images ids for current cv split
+            pneumonia_train, pneumonia_val = next(pneumonia_split)
+            norma_train, norma_val = next(norma_split)
+
+            # set train datasets and loaders
+            train_subsamples = (pneumonia_ids[pneumonia_train], norma_ids[norma_train])
+            train_dataset = ChestDataset(**cfg.train_dataset, subsamples=train_subsamples)
+            train_loader_cfg = get_loader_config(cfg, train_dataset, kind="train", distributed=distributed)
+            train_dataloader = DataLoader(train_dataset, **train_loader_cfg)
+
+            # set val datasets and loaders
+            val_subsamples = (pneumonia_ids[pneumonia_val], norma_ids[norma_val])
+            val_dataset = ChestDataset(**cfg.val_dataset, subsamples=val_subsamples)
+            val_loader_cfg = get_loader_config(cfg, val_dataset, kind="val", distributed=distributed)
+            val_dataloader = DataLoader(val_dataset, **val_loader_cfg)
+
+            meta = run_cv_step(
+                cv_step=cv_step + 1,
+                model=model,
+                loss_fn=loss_fn,  # noqa
+                cfg=cfg,
+                train_dataloader=train_dataloader,
+                val_dataloader=val_dataloader,
+                optimizer=optimizer,  # noqa
+                amp_autocast=amp_autocast,
+                lr_scheduler=lr_scheduler,
+                gradient_scaler=gradient_scaler,
+                meta=meta,
+                distributed=distributed,
+                logger=logger,
+            )
+        except KeyboardInterrupt:
+            if cfg.local_rank == 0:
+                logger.info("Training was interrupted. Saving last checkpoint\n")
+                save_checkpoint(model, meta["exp_dir"] / f"CV{cv_step}_last.pth")
+            break
+
     log_artifacts(cfg, meta)
 
     if distributed:

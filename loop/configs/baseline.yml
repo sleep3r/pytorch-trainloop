@@ -1,14 +1,21 @@
 training:
     exp_name: 'baseline'
-    work_dir: '/home/sleep3r/sber/runs/chest_uncertainty'
     log_level: INFO
-    watch_model:
-        log: "all"
-        log_freq: 1
+
+    total_epochs: 25
+
+    work_dir: '/data/sleep3r/runs'
+    images_path: &images_path "/data/sleep3r/chest_dataset/images"
+    masks_path: &masks_path "/data/sleep3r/chest_dataset/masks"
+    duplicates_path: &duplicates_path "/data/sleep3r/chest_dataset/groups.json"
+
+    classes: &classes [ "pneumonia" ]
+    projections: &projections [ "pa" ]
 
     seed: 228
     precision: 10
     deterministic: false
+    fold_seed_step: 5
 
     dist_params:
         backend: nccl
@@ -19,15 +26,15 @@ training:
 
     cudnn_benchmark: false # auto false if deterministic is true
     channels_last: false
-    find_unused_parameters: false
+    find_unused_parameters: true
 
-    clip_grad:
-    clip_mode:
+    clip_grad: 1.0
+    clip_mode: norm
 
 
 image_params: &image_params
-    height: 512
-    width: 512
+    width: 704
+    height: 800
 
     img_norm_cfg:
         mean: [ 0.485, 0.456, 0.406 ]
@@ -35,18 +42,23 @@ image_params: &image_params
 
 
 loss:
-    type: segmentation_models_pytorch.utils.losses.DiceLoss
+    type: segmentation_models_pytorch.utils.losses.BCELoss
 
 
 model:
-    type: segmentation_models_pytorch.FPN
+    type: segmentation_models_pytorch.DeepLabV3Plus
     params:
-        encoder_name: se_resnext50_32x4d
+        encoder_name: efficientnet-b4
         encoder_weights: imagenet
         classes: 1
         activation: sigmoid
 
-    use_preprocessing: true
+        # classification head
+        aux_params:
+            pooling: max
+            dropout: 0.1
+            activation: softmax
+            classes: 2
 
 
 evaluation:
@@ -54,65 +66,77 @@ evaluation:
     best_metric: "iou"
 
 
-stages:
-    stage_1:
-        total_epochs: 100
+cross_validation:
+    n_splits: 5
 
-        loader:
-            batch_size: &batch_size 10
-            pin_memory: true
-            num_workers: 0 # often is better to set 0 while distributed training
-            drop_last: true
-            shuffle: false
+    duplicates_path: *duplicates_path
 
-            collate_fn:
-                type: dataset.Collect
-                params:
-                    meta_keys: [ ]
 
-        train_dataset:
+loader:
+    batch_size: &batch_size 3
+
+    pin_memory: true
+    num_workers: 0 # often is better to set 0 while distributed training
+    drop_last: true
+    shuffle: false
+
+    collate_fn:
+        type: dataset.Collect
+        params:
+            meta_keys: [ ]
+
+
+train_dataset:
+    kind: "train"
+    batch_size: *batch_size
+
+    steps_per_epoch:
+
+    images_path: *images_path
+    masks_path: *masks_path
+
+    classes: *classes
+    projections: *projections
+
+    image_params: *image_params
+
+    aggregate_masks: false
+    read_norma: true
+
+    transform:
+        type: transform.ChestTransform
+        params:
             kind: "train"
-            batch_size: *batch_size
-            steps_per_epoch: 20
-
             image_params: *image_params
+            augs_lvl: "hard"
 
-            images_path: "/home/sleep3r/sber/dataset/images"
-            masks_path: "/home/sleep3r/sber/dataset/masks"
-            classes: &classes [ "pneumonia" ]
 
-            aggregate_masks: false
-            read_norma: true
+val_dataset:
+    kind: "val"
 
-            transform:
-                type: transform.ChestTransform
-                params:
-                    kind: "train"
-                    image_params: *image_params
-                    augs_lvl: "hard"
+    image_params: *image_params
 
-        val_dataset:
+    images_path: *images_path
+    masks_path: *masks_path
+
+    classes: *classes
+    projections: *projections
+
+    aggregate_masks: false
+    read_norma: true
+
+    transform:
+        type: transform.ChestTransform
+        params:
             kind: "val"
-
             image_params: *image_params
 
-            images_path: "/home/sleep3r/sber/dataset/images_val"
-            masks_path: "/home/sleep3r/sber/dataset/masks_val"
-            classes: *classes
 
-            aggregate_masks: true
-            read_norma: false
-            per_folder_ratio: 0.05
+optimizer:
+    type: torch.optim.Adam
+    params:
+        lr: 0.0003
+        weight_decay: 0.00001
 
-            transform:
-                type: transform.ChestTransform
-                params:
-                    kind: "val"
-                    image_params: *image_params
 
-        optimizer:
-            type: torch.optim.Adam
-            params:
-                lr: 0.0003
-
-        lr_scheduler:
+lr_scheduler:

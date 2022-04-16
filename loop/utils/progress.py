@@ -61,7 +61,7 @@ def update_task(task_id: Optional[TaskID], advance: int = 1) -> None:
         progress.update(task_id, advance=advance)
 
 
-def reset_task(task_id: Optional[TaskID]) -> None:
+def remove_task(task_id: Optional[TaskID]) -> None:
     """
     Stops and resets the progress bar.
 
@@ -70,4 +70,4 @@ def reset_task(task_id: Optional[TaskID]) -> None:
     """
     if task_id is not None:
         progress.stop_task(task_id)
-        progress.reset(task_id)
+        progress.remove_task(task_id)
